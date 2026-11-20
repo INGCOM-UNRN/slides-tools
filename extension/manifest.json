@@ -21,6 +21,7 @@
       "matches": [
         "https://docs.google.com/presentation/*"
       ],
+      "match_about_blank": true,
       "js": [
         "content-present.js",
         "content-speaker.js"

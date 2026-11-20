@@ -6,25 +6,47 @@
 (function () {
   "use strict";
 
-  // Ejecutar únicamente en la ventana de notas del presentador
+  // La vista del orador es un popup about:blank que Slides escribe desde la pestaña principal
+  // (el manifiesto inyecta ahí con match_about_blank). En la pestaña principal este script no
+  // hace nada: antes registraba igual sus listeners y cada segundo informaba «diapositiva 1/1,
+  // modo orador», pisando lo que reportaba content-present.js.
   function isPresenterWindow() {
-    return window.location.href.includes("presenter") || Boolean(document.querySelector(".punch-speaker-notes-text"));
+    return window.location.protocol === "about:" ||
+      window.location.href.includes("presenter") ||
+      Boolean(document.querySelector(".punch-speaker-notes-text"));
   }
 
   let isInitialized = false;
   let daemonConnected = false;
   let currentPin = "----";
   let currentClientsCount = 0;
+  let connState = "desconectado";
+  let connStateHasta = 0;
+  let lastCommand = null;
+  let lastCommandShownAt = 0;
   let speakerDockElement = null;
+  let observer = null;
 
   function initSpeakerNotes() {
     if (isInitialized) return;
     if (!isPresenterWindow()) return;
     isInitialized = true;
 
-    renderSpeakerDock();
-    setupObservers();
+    chrome.runtime.onMessage.addListener(onBackgroundMessage);
+    ensureSpeakerDock();
     reportSpeakerStateToBackground();
+
+    // Consultar estado inicial
+    chrome.runtime.sendMessage({ type: "GET_DAEMON_INFO" }, (res) => {
+      if (chrome.runtime.lastError || !res) return;
+      applyDaemonStatus(res);
+    });
+
+    setInterval(() => {
+      ensureSpeakerDock();
+      reportSpeakerStateToBackground();
+      updateSpeakerDockUI(); // refresca «hace N s» y las cuentas regresivas
+    }, 1000);
   }
 
   // ---------------------------------------------------------------------------
@@ -62,7 +84,8 @@
     const pauseBtn = document.querySelector(
       'button[aria-label*="Pause" i], button[aria-label*="Pausa" i], button[aria-label*="Resume" i], button[aria-label*="Reanudar" i]'
     );
-    const isPaused = pauseBtn ? (pauseBtn.getAttribute("aria-label") || "").toLowerCase().includes("reanudar") : false;
+    const label = (pauseBtn?.getAttribute("aria-label") || "").toLowerCase();
+    const isPaused = label.includes("reanudar") || label.includes("resume");
 
     return {
       elapsedSeconds: seconds,
@@ -72,31 +95,26 @@
   }
 
   function reportSpeakerStateToBackground() {
-    const notes = extractSpeakerNotes();
-    const timer = extractNativeTimer();
+    const data = {
+      isPresenting: true,
+      presentationMode: "presenter_view",
+      speakerNotes: extractSpeakerNotes(),
+      timer: extractNativeTimer()
+    };
 
-    // Intentar leer número de slide en vista de orador
-    let currentSlide = 1;
-    let totalSlides = 1;
+    // Número de diapositiva en la vista de orador: sólo si se encontró, para no pisar
+    // con 1/1 el dato que informa la pestaña de la presentación.
     const slideInfo = document.querySelector(".punch-viewer-speaker-slide-info");
-    if (slideInfo && slideInfo.textContent) {
-      const m = slideInfo.textContent.match(/(\d+)\s*\/\s*(\d+)/);
-      if (m) {
-        currentSlide = parseInt(m[1], 10);
-        totalSlides = parseInt(m[2], 10);
-      }
+    const m = slideInfo?.textContent?.match(/(\d+)\s*\/\s*(\d+)/);
+    if (m) {
+      data.currentSlide = parseInt(m[1], 10);
+      data.totalSlides = parseInt(m[2], 10);
     }
 
     chrome.runtime.sendMessage({
       type: "UPDATE_PRESENTATION_STATE",
-      data: {
-        isPresenting: true,
-        presentationMode: "presenter_view",
-        currentSlide: currentSlide,
-        totalSlides: totalSlides,
-        speakerNotes: notes,
-        timer: timer
-      }
+      role: "speaker",
+      data: data
     }).catch(() => {});
   }
 
@@ -130,8 +148,80 @@
   // Barra Superior en Vista de Orador (Sección 3.2)
   // ---------------------------------------------------------------------------
 
-  function renderSpeakerDock() {
-    if (speakerDockElement) return;
+  const NOMBRES_COMANDO = {
+    NEXT_SLIDE: "Siguiente",
+    PREV_SLIDE: "Anterior",
+    FIRST_SLIDE: "Primera diapositiva",
+    LAST_SLIDE: "Última diapositiva",
+    GO_TO_SLIDE: "Ir a diapositiva",
+    TOGGLE_BLACKOUT: "Pantalla negra",
+    TOGGLE_WHITEOUT: "Pantalla blanca",
+    TOGGLE_LASER: "Puntero láser",
+    TIMER_RESET: "Reiniciar cronómetro",
+    TIMER_TOGGLE_PAUSE: "Pausar/reanudar cronómetro"
+  };
+
+  function segundosHasta(ms) {
+    return Math.max(0, Math.ceil((ms - Date.now()) / 1000));
+  }
+
+  function textoEstado() {
+    switch (connState) {
+      case "emparejado":
+        return { texto: "Conectado al daemon", clase: "ok" };
+      case "conectando":
+        return { texto: "Emparejando…", clase: "pendiente" };
+      case "sin_pin":
+        return { texto: "Falta configurar el PIN", clase: "error" };
+      case "pin_rechazado":
+        return { texto: "PIN rechazado: revisalo", clase: "error" };
+      case "bloqueado":
+        return { texto: `Bloqueado por intentos fallidos · reintento en ${segundosHasta(connStateHasta)} s`, clase: "error" };
+      default: {
+        const s = segundosHasta(connStateHasta);
+        return { texto: s > 0 ? `Sin daemon · reintento en ${s} s` : "Sin daemon", clase: "error" };
+      }
+    }
+  }
+
+  function textoUltimoComando() {
+    if (!lastCommand) return { texto: "Último comando: —", titulo: "", clase: "" };
+
+    let nombre = NOMBRES_COMANDO[lastCommand.action] || lastCommand.action;
+    if (lastCommand.action === "GO_TO_SLIDE" && lastCommand.args?.slideNumber) {
+      nombre += ` ${lastCommand.args.slideNumber}`;
+    }
+    const o = lastCommand.origin;
+    const origen = o ? ` · ${o.clientName || "?"}${o.deviceType ? ` (${o.deviceType})` : ""}` : "";
+    const hace = Math.max(0, Math.round((Date.now() - lastCommand.receivedAt) / 1000));
+
+    let resultado = "";
+    let clase = "";
+    if (lastCommand.status === "pending") {
+      resultado = "…";
+      clase = "pendiente";
+    } else if (lastCommand.status === "ok") {
+      resultado = "✓";
+      clase = "ok";
+    } else if (lastCommand.status === "unconfirmed") {
+      resultado = "sin confirmar";
+      clase = "pendiente";
+    } else {
+      resultado = `✗ ${lastCommand.details || lastCommand.status}`;
+      clase = "error";
+    }
+
+    return {
+      texto: `Último comando: ${nombre}${origen} · hace ${hace} s · ${resultado}`,
+      titulo: lastCommand.details ? `Detalle: ${lastCommand.details}` : "",
+      clase: clase
+    };
+  }
+
+  function ensureSpeakerDock() {
+    // Slides puede reescribir el documento del popup (document.open/write) y borrar la barra.
+    if (speakerDockElement && speakerDockElement.isConnected) return;
+    if (!document.body) return;
 
     speakerDockElement = document.createElement("div");
     speakerDockElement.className = "slide-bridge-speaker-dock";
@@ -141,49 +231,71 @@
     leftGroup.className = "left-group";
 
     const dot = document.createElement("span");
-    dot.className = `slide-bridge-dot ${daemonConnected ? "" : "disconnected"}`;
+    dot.className = "slide-bridge-dot";
     dot.id = "speaker-bridge-dot";
 
     const titleStrong = document.createElement("strong");
-    titleStrong.textContent = "Google Slides Bridge";
+    titleStrong.textContent = "Slides Bridge";
 
-    const subtitleSpan = document.createElement("span");
-    subtitleSpan.style.color = "#9aa0a6";
-    subtitleSpan.textContent = "| Vista de Orador";
+    const estadoSpan = document.createElement("span");
+    estadoSpan.className = "slide-bridge-estado";
+    estadoSpan.id = "speaker-bridge-estado";
 
     leftGroup.appendChild(dot);
     leftGroup.appendChild(titleStrong);
-    leftGroup.appendChild(subtitleSpan);
+    leftGroup.appendChild(estadoSpan);
+
+    const centerGroup = document.createElement("div");
+    centerGroup.className = "center-group";
+
+    const ultimoSpan = document.createElement("span");
+    ultimoSpan.className = "slide-bridge-ultimo-comando";
+    ultimoSpan.id = "speaker-bridge-ultimo";
+    centerGroup.appendChild(ultimoSpan);
 
     const rightGroup = document.createElement("div");
     rightGroup.className = "right-group";
 
     const clientsSpan = document.createElement("span");
     clientsSpan.id = "speaker-bridge-clients";
-    clientsSpan.textContent = `${currentClientsCount} disp. conectados`;
 
     const pinBadge = document.createElement("span");
     pinBadge.className = "slide-bridge-pin-badge";
     pinBadge.id = "speaker-bridge-pin";
     pinBadge.title = "Hacé click para cambiar o indicar el PIN";
-    pinBadge.textContent = (currentPin && currentPin !== "----") ? `PIN: ${currentPin}` : "Configurar PIN";
     pinBadge.onclick = showSpeakerPinModal;
 
     rightGroup.appendChild(clientsSpan);
     rightGroup.appendChild(pinBadge);
 
     speakerDockElement.appendChild(leftGroup);
+    speakerDockElement.appendChild(centerGroup);
     speakerDockElement.appendChild(rightGroup);
 
     document.body.prepend(speakerDockElement);
     document.body.style.paddingTop = "38px";
 
+    setupObservers();
+    updateSpeakerDockUI();
   }
 
   function updateSpeakerDockUI() {
     const dot = document.getElementById("speaker-bridge-dot");
     if (dot) {
-      dot.className = "slide-bridge-dot " + (daemonConnected ? "" : "disconnected");
+      dot.className = "slide-bridge-dot" + (connState === "emparejado" ? "" : " disconnected");
+    }
+    const estado = document.getElementById("speaker-bridge-estado");
+    if (estado) {
+      const e = textoEstado();
+      estado.textContent = e.texto;
+      estado.className = `slide-bridge-estado ${e.clase}`;
+    }
+    const ultimo = document.getElementById("speaker-bridge-ultimo");
+    if (ultimo) {
+      const u = textoUltimoComando();
+      ultimo.textContent = u.texto;
+      ultimo.title = u.titulo;
+      ultimo.className = `slide-bridge-ultimo-comando ${u.clase}`;
     }
     const clients = document.getElementById("speaker-bridge-clients");
     if (clients) {
@@ -193,6 +305,31 @@
     if (pin) {
       pin.textContent = (currentPin && currentPin !== "----") ? `PIN: ${currentPin}` : "Configurar PIN";
     }
+  }
+
+  function flashUltimoComando() {
+    const ultimo = document.getElementById("speaker-bridge-ultimo");
+    if (!ultimo) return;
+    ultimo.classList.add("slide-bridge-command-flash");
+    setTimeout(() => ultimo.classList.remove("slide-bridge-command-flash"), 400);
+  }
+
+  function applyDaemonStatus(msg) {
+    daemonConnected = Boolean(msg.isConnected ?? msg.connected);
+    currentPin = msg.pin || "----";
+    currentClientsCount = msg.clientsCount || 0;
+    if (msg.connState) connState = msg.connState;
+    connStateHasta = msg.connStateHasta || 0;
+    if (msg.lastCommand !== undefined) {
+      lastCommand = msg.lastCommand;
+      if (lastCommand && lastCommand.receivedAt !== lastCommandShownAt) {
+        lastCommandShownAt = lastCommand.receivedAt;
+        updateSpeakerDockUI();
+        flashUltimoComando();
+        return;
+      }
+    }
+    updateSpeakerDockUI();
   }
 
   function showSpeakerPinModal() {
@@ -223,7 +360,7 @@
     const pinInput = document.createElement("input");
     pinInput.type = "text";
     pinInput.className = "slide-bridge-pin-input";
-    pinInput.placeholder = "Ej: 1234";
+    pinInput.placeholder = "Ej: 123456";
     pinInput.maxLength = 12;
     pinInput.value = (currentPin && currentPin !== "----") ? currentPin : "";
 
@@ -285,7 +422,10 @@
   }
 
   function setupObservers() {
-    const observer = new MutationObserver(() => {
+    if (observer) observer.disconnect();
+    observer = new MutationObserver((mutations) => {
+      // Ignorar los cambios de la propia barra (si no, cada refresco dispara otro reporte).
+      if (mutations.every((m) => speakerDockElement && speakerDockElement.contains(m.target))) return;
       reportSpeakerStateToBackground();
     });
 
@@ -300,12 +440,9 @@
   // Manejo de Mensajes desde Background
   // ---------------------------------------------------------------------------
 
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  function onBackgroundMessage(msg, sender, sendResponse) {
     if (msg.type === "DAEMON_STATUS") {
-      daemonConnected = msg.connected;
-      currentPin = msg.pin || "----";
-      currentClientsCount = msg.clientsCount || 0;
-      updateSpeakerDockUI();
+      applyDaemonStatus(msg);
       sendResponse({ received: true });
       return true;
     }
@@ -313,31 +450,24 @@
     if (msg.action === "TIMER_RESET") {
       const ok = handleTimerReset();
       reportSpeakerStateToBackground();
-      sendResponse({ status: ok ? "ok" : "button_not_found" });
+      sendResponse(ok ? { status: "ok" } : { status: "failed", details: "button_not_found" });
       return true;
     }
 
     if (msg.action === "TIMER_TOGGLE_PAUSE") {
       const ok = handleTimerTogglePause();
       reportSpeakerStateToBackground();
-      sendResponse({ status: ok ? "ok" : "button_not_found" });
+      sendResponse(ok ? { status: "ok" } : { status: "failed", details: "button_not_found" });
       return true;
     }
-  });
-
-  // Consultar estado inicial
-  chrome.runtime.sendMessage({ type: "GET_DAEMON_INFO" }, (res) => {
-    if (chrome.runtime.lastError || !res) return;
-    daemonConnected = res.isConnected;
-    currentPin = res.pin || "----";
-    currentClientsCount = res.clientsCount || 0;
-    updateSpeakerDockUI();
-  });
+    return false;
+  }
 
   window.addEventListener("DOMContentLoaded", initSpeakerNotes);
   if (document.body) {
+    initSpeakerNotes();
+    // El popup puede no ser reconocible al cargar (notas todavía sin escribir).
     setTimeout(initSpeakerNotes, 500);
+    setTimeout(initSpeakerNotes, 2000);
   }
-
-  setInterval(reportSpeakerStateToBackground, 1000);
 })();

@@ -6,8 +6,11 @@
 (function () {
   "use strict";
 
-  // Descartar ejecución si este contexto corresponde a la ventana emergente de notas
-  if (window.location.href.includes("presenter") || document.querySelector(".punch-speaker-notes-text")) {
+  // La vista del orador es un popup about:blank que Slides escribe desde la pestaña principal
+  // (el manifiesto inyecta ahí con match_about_blank). Ese contexto es de content-speaker.js:
+  // si este script también respondiera, cada comando se aplicaría dos veces.
+  if (window.location.protocol === "about:" || window.location.href.includes("presenter") ||
+      document.querySelector(".punch-speaker-notes-text")) {
     return;
   }
 
@@ -20,8 +23,37 @@
   // 5.1. Inyección de Comandos Sintéticos de Teclado
   // ---------------------------------------------------------------------------
 
-  function dispatchPresentationKey(code, key, keyCode) {
-    const target = document.activeElement || window;
+  // Al presentar desde el editor, Slides no cambia de URL: dibuja la presentación en un iframe
+  // del mismo origen y escucha el teclado dentro de él. Un evento despachado en el documento
+  // principal nunca llega a esos manejadores: por eso los comandos no hacían nada en modo
+  // presentación. En /present (pestaña propia) no hay iframe y se usa el documento principal.
+  const SELECTOR_IFRAME_PRESENTACION =
+    "iframe.punch-present-iframe, .punch-present-iframe iframe, iframe[class*='punch-present']";
+
+  function iframePresentacion() {
+    for (const f of document.querySelectorAll(SELECTOR_IFRAME_PRESENTACION)) {
+      // Slides puede dejar el iframe oculto al salir de la presentación.
+      if (f.offsetWidth === 0 && f.offsetHeight === 0) continue;
+      try {
+        const doc = f.contentDocument;
+        if (doc && doc.body) return { frame: f, doc: doc };
+      } catch (e) {
+        // De otro origen: inaccesible, se sigue con el siguiente.
+      }
+    }
+    return null;
+  }
+
+  function documentoDestino() {
+    const ifr = iframePresentacion();
+    if (ifr) return { doc: ifr.doc, donde: "iframe_presentacion" };
+    return { doc: document, donde: "documento" };
+  }
+
+  function dispatchPresentationKey(doc, code, key, keyCode) {
+    const active = doc.activeElement;
+    const target = active && active !== doc.documentElement ? active : (doc.body || doc);
+    // Sin `view`: el evento se crea en este contexto y se despacha en el del iframe.
     const eventData = {
       key: key,
       code: code,
@@ -29,53 +61,45 @@
       which: keyCode,
       bubbles: true,
       cancelable: true,
-      composed: true,
-      view: window
+      composed: true
     };
 
     target.dispatchEvent(new KeyboardEvent("keydown", eventData));
+    // Una tecla real con carácter también genera keypress, y hay manejadores que sólo miran ése.
+    if (key.length === 1) {
+      target.dispatchEvent(new KeyboardEvent("keypress", { ...eventData, charCode: key.charCodeAt(0) }));
+    }
     target.dispatchEvent(new KeyboardEvent("keyup", eventData));
   }
 
+  const TECLAS = {
+    NEXT_SLIDE: ["ArrowRight", "ArrowRight", 39],
+    PREV_SLIDE: ["ArrowLeft", "ArrowLeft", 37],
+    FIRST_SLIDE: ["Home", "Home", 36],
+    LAST_SLIDE: ["End", "End", 35],
+    TOGGLE_BLACKOUT: ["KeyB", "b", 66],
+    TOGGLE_WHITEOUT: ["KeyW", "w", 87],
+    TOGGLE_LASER: ["KeyL", "l", 76]
+  };
+
+  /** Ejecuta el comando; null si no es de esta pestaña (p. ej. temporizador). */
   function handleCommand(msg) {
     const act = msg.action;
-    switch (act) {
-      case "NEXT_SLIDE":
-        dispatchPresentationKey("ArrowRight", "ArrowRight", 39);
-        break;
-      case "PREV_SLIDE":
-        dispatchPresentationKey("ArrowLeft", "ArrowLeft", 37);
-        break;
-      case "FIRST_SLIDE":
-        dispatchPresentationKey("Home", "Home", 36);
-        break;
-      case "LAST_SLIDE":
-        dispatchPresentationKey("End", "End", 35);
-        break;
-      case "TOGGLE_BLACKOUT":
-        dispatchPresentationKey("KeyB", "b", 66);
-        break;
-      case "TOGGLE_WHITEOUT":
-        dispatchPresentationKey("KeyW", "w", 87);
-        break;
-      case "TOGGLE_LASER":
-        dispatchPresentationKey("KeyL", "l", 76);
-        break;
-      case "GO_TO_SLIDE":
-        const targetSlide = parseInt(msg.payload?.slideNumber, 10);
-        if (targetSlide > 0) {
-          const str = targetSlide.toString();
-          for (let i = 0; i < str.length; i++) {
-            const digit = str[i];
-            const code = `Digit${digit}`;
-            const keyCode = 48 + parseInt(digit, 10);
-            dispatchPresentationKey(code, digit, keyCode);
-          }
-          dispatchPresentationKey("Enter", "Enter", 13);
-        }
-        break;
-      default:
-        return false;
+    const { doc, donde } = documentoDestino();
+
+    if (TECLAS[act]) {
+      dispatchPresentationKey(doc, ...TECLAS[act]);
+    } else if (act === "GO_TO_SLIDE") {
+      const targetSlide = parseInt(msg.payload?.slideNumber, 10);
+      if (!(targetSlide > 0)) {
+        return { status: "failed", details: "slideNumber inválido" };
+      }
+      for (const digit of String(targetSlide)) {
+        dispatchPresentationKey(doc, `Digit${digit}`, digit, 48 + parseInt(digit, 10));
+      }
+      dispatchPresentationKey(doc, "Enter", "Enter", 13);
+    } else {
+      return null;
     }
 
     // Flash visual sutil en el dock
@@ -83,7 +107,7 @@
       miniDockElement.classList.add("slide-bridge-command-flash");
       setTimeout(() => miniDockElement.classList.remove("slide-bridge-command-flash"), 400);
     }
-    return true;
+    return { status: "ok", details: `teclado:${donde}` };
   }
 
   // ---------------------------------------------------------------------------
@@ -91,37 +115,36 @@
   // ---------------------------------------------------------------------------
 
   function scrapePresentationState() {
-    let currentSlide = 1;
-    let totalSlides = 1;
-
-    // Selector habitual de visor de diapositivas
-    const slideInput = document.querySelector("input.punch-viewer-slide-number-input");
-    if (slideInput) {
-      currentSlide = parseInt(slideInput.value, 10) || 1;
-      const totalSpan = slideInput.parentElement?.textContent;
-      if (totalSpan) {
-        const m = totalSpan.match(/\/(\d+)/);
-        if (m) totalSlides = parseInt(m[1], 10);
-      }
-    }
-
-    const title = document.title.replace(/ - Google Slides$/, "").replace(/ - Presentaciones de Google$/, "").trim();
-    const isPresenting = window.location.href.includes("/present") || window.location.href.includes("/fullscreen");
-
-    return {
-      presentationTitle: title,
-      isPresenting: isPresenting,
-      presentationMode: isPresenting ? "standard" : "edit",
-      currentSlide: currentSlide,
-      totalSlides: totalSlides
+    const ifr = iframePresentacion();
+    const data = {
+      presentationTitle: document.title
+        .replace(/ - Google Slides$/, "")
+        .replace(/ - Presentaciones de Google$/, "")
+        .trim(),
+      isPresenting: Boolean(ifr) || Boolean(document.fullscreenElement) ||
+        window.location.href.includes("/present") || window.location.href.includes("/fullscreen")
     };
+
+    // El número de diapositiva está en el visor: dentro del iframe al presentar desde el editor.
+    // Sólo se informa si se encontró; antes se mandaba 1/1 y pisaba el dato de la vista del orador.
+    const docs = ifr ? [ifr.doc, document] : [document];
+    for (const doc of docs) {
+      const slideInput = doc.querySelector("input.punch-viewer-slide-number-input");
+      if (!slideInput) continue;
+      const actual = parseInt(slideInput.value, 10);
+      if (actual > 0) data.currentSlide = actual;
+      const m = (slideInput.parentElement?.textContent || "").match(/\/\s*(\d+)/);
+      if (m) data.totalSlides = parseInt(m[1], 10);
+      break;
+    }
+    return data;
   }
 
   function reportStateToBackground() {
-    const data = scrapePresentationState();
     chrome.runtime.sendMessage({
       type: "UPDATE_PRESENTATION_STATE",
-      data: data
+      role: "present",
+      data: scrapePresentationState()
     }).catch(() => {});
   }
 
@@ -325,9 +348,12 @@
     }
 
     if (msg.type === "command") {
-      const ok = handleCommand(msg);
+      const res = handleCommand(msg);
+      // Si no es de esta pestaña no se contesta: así responde la que sí lo ejecuta
+      // (antes un «unhandled» de acá le ganaba al «ok» de la vista del orador).
+      if (!res) return false;
       reportStateToBackground();
-      sendResponse({ status: ok ? "ok" : "unhandled" });
+      sendResponse(res);
       return true;
     }
   });
