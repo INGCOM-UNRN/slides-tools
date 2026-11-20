@@ -4,6 +4,23 @@ Todos los cambios notables de este proyecto se documentan en este archivo.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/);
 versiones según [SemVer](https://semver.org/lang/es/).
 
+## [1.3.2] - 2026-11-20
+
+### Corregido
+
+- Los comandos no llegaban a la presentación: al presentar desde el editor, Slides dibuja la presentación en un iframe y la extensión despachaba las teclas en el documento principal. Ahora las envía al iframe visible de la presentación (o al documento en `/present`).
+- El script de la vista del orador también corría en la pestaña principal, informaba «diapositiva 1/1» cada segundo y contestaba los comandos del cronómetro antes que la vista del orador.
+- Los comandos iban a la pestaña activa de cada ventana: con dos presentaciones abiertas avanzaban las dos. Ahora van a la que está presentando, y los del cronómetro a la vista del orador.
+- Ante un PIN rechazado la extensión reintentaba sola con el mismo PIN y en unos 15 s bloqueaba su propia IP; además podía quedar con dos conexiones abiertas al guardar el PIN.
+- Un token de reconexión vencido contaba como intento fallido y bloqueaba al dispositivo cuando se tecleaba el PIN correcto.
+- `mock-slides` confirmaba los comandos como daemon y cada uno esperaba los 2,5 s del tiempo límite; tampoco actualizaba las notas al saltar a una diapositiva.
+
+### Agregado
+
+- Barra de la vista del orador con el estado de la conexión (emparejado, PIN rechazado, bloqueado o reintento) y el último comando: cuál, de qué dispositivo, hace cuánto y cómo terminó.
+- El daemon indica en `origin` quién envió cada comando reenviado a la extensión.
+- El log del daemon explica cada rechazo de emparejamiento y cuánto falta para que termine un bloqueo; el error incluye `retryAfter`.
+
 ## [1.3.1] - 2026-10-28
 
 ### Corregido

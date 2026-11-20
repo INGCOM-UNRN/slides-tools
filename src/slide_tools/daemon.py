@@ -114,7 +114,7 @@ class SlideDaemon:
                 port=self.port,
                 properties={
                     "service": "slides",
-                    "version": "1.3.1",
+                    "version": "1.3.2",
                     "requires_pin": "1" if self.require_pin else "0",
                 },
                 host_ip=self.lan_ip,
