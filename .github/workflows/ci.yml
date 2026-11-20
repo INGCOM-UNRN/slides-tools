@@ -26,7 +26,7 @@ jobs:
       - name: Sincronizar dependencias
         run: |
           uv sync --all-extras
-          uv pip install "git+https://github.com/martinvilu/cast-tools-common.git"
+          uv pip install "git+https://github.com/INGCOM-UNRN/cast-tools-common.git"
           sudo npm install -g web-ext
 
       - name: Ejecutar suite de pruebas

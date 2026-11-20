@@ -33,9 +33,9 @@ dependencies = [
     "zeroconf>=0.151.3",
     # Biblioteca compartida con meet-tools. Referencia directa a git: el
     # nombre no está publicado en PyPI y se instala siempre desde el repositorio.
-    "cast-tools-common @ git+https://github.com/martinvilu/cast-tools-common@ae23dd31b0da7f04637cf8b15e6b83b11c4af30c",
+    "cast-tools-common @ git+https://github.com/INGCOM-UNRN/cast-tools-common@ae23dd31b0da7f04637cf8b15e6b83b11c4af30c",
     # Núcleo común del ecosistema (N-ECO-14): contrato de línea de comandos y textos en español.
-    "yutani @ git+https://github.com/INGCOM-UNRN-P1/yutani@cf49348fae40d264006fe07dee2cc9e88dd9c934",
+    "yutani @ git+https://github.com/INGCOM-UNRN/yutani@cf49348fae40d264006fe07dee2cc9e88dd9c934",
 ]
 
 [project.scripts]
@@ -52,9 +52,9 @@ allow-direct-references = true
 packages = ["src/slide_tools"]
 
 [project.urls]
-Homepage = "https://github.com/martinvilu/slides-tools"
-Repository = "https://github.com/martinvilu/slides-tools.git"
-Issues = "https://github.com/martinvilu/slides-tools/issues"
+Homepage = "https://github.com/INGCOM-UNRN/slides-tools"
+Repository = "https://github.com/INGCOM-UNRN/slides-tools.git"
+Issues = "https://github.com/INGCOM-UNRN/slides-tools/issues"
 
 [dependency-groups]
 dev = [
