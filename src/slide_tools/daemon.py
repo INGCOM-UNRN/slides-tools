@@ -365,6 +365,12 @@ class SlideDaemon:
             req_id = f"cmd_{self._cmd_counter}"
             payload = dict(msg.payload)
             payload["requestId"] = req_id
+            # Quién mandó el comando, para que la extensión lo muestre en la vista del orador.
+            payload["origin"] = {
+                "clientId": session.client_id,
+                "clientName": session.client_name,
+                "deviceType": session.device_type if session.device_type != "unknown" else str(getattr(msg.source, "value", msg.source)),
+            }
 
             fwd_msg = Message.command(msg.action, payload, source=Source.DAEMON)
             loop = asyncio.get_running_loop()

@@ -106,6 +106,9 @@ async def test_successful_pairing_and_multiclient_broadcast(daemon_fixture):
                 ext_cmd = Message.from_json(await asyncio.wait_for(ext.recv(), timeout=2.0))
                 assert ext_cmd.action == Action.NEXT_SLIDE.value
                 req_id = ext_cmd.payload["requestId"]
+                # La extensión sabe quién lo mandó, para mostrarlo en la vista del orador.
+                assert ext_cmd.payload["origin"]["deviceType"] == "hardware"
+                assert ext_cmd.payload["origin"]["clientId"].startswith("c_")
 
                 # Extensión responde con ACK y nuevo estado (slide 2)
                 ack_msg = Message.ack("NEXT_SLIDE", status="ok", source=Source.EXTENSION,
