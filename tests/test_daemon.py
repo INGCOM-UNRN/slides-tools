@@ -108,12 +108,16 @@ async def test_successful_pairing_and_multiclient_broadcast(daemon_fixture):
                 req_id = ext_cmd.payload["requestId"]
 
                 # Extensión responde con ACK y nuevo estado (slide 2)
-                ack_msg = Message.ack("NEXT_SLIDE", status="ok", extra={"requestId": req_id})
+                ack_msg = Message.ack("NEXT_SLIDE", status="ok", source=Source.EXTENSION,
+                                      extra={"requestId": req_id})
                 await ext.send(ack_msg.to_json())
 
-                # Hardware que envió el comando recibe ACK
+                # Hardware que envió el comando recibe el ACK de la extensión, no el de
+                # respaldo que el daemon emite al vencer el tiempo límite.
                 hw_ack = Message.from_json(await asyncio.wait_for(hw.recv(), timeout=2.0))
                 assert hw_ack.type == MessageType.ACK
+                assert hw_ack.payload.get("requestId") == req_id
+                assert hw_ack.payload.get("details") != "dispatched_timeout_ack"
 
                 # Extensión emite nuevo STATE_SYNC
                 ext_state.currentSlide = 2

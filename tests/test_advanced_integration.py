@@ -50,7 +50,8 @@ async def test_navigation_and_visual_toggles(running_server):
                 msg = Message.from_json(raw)
                 if msg.type == MessageType.COMMAND:
                     req_id = msg.payload.get("requestId")
-                    ack = Message.ack(msg.action, status="ok", extra={"requestId": req_id})
+                    ack = Message.ack(msg.action, status="ok", source=Source.EXTENSION,
+                                      extra={"requestId": req_id})
                     await ext.send(ack.to_json())
 
         worker_task = asyncio.create_task(ext_worker())
@@ -64,9 +65,11 @@ async def test_navigation_and_visual_toggles(running_server):
                     resp = await client.send_command(act)
                     assert resp.type == MessageType.ACK
                     assert resp.payload.get("status") == "ok"
+                    assert resp.payload.get("details") != "dispatched_timeout_ack"
 
                 resp_goto = await client.send_command(Action.GO_TO_SLIDE, {"slideNumber": 12})
                 assert resp_goto.type == MessageType.ACK
+                assert resp_goto.payload.get("details") != "dispatched_timeout_ack"
         finally:
             worker_task.cancel()
 

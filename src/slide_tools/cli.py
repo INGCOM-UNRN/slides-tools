@@ -358,11 +358,9 @@ def mock_slides(
                     if msg.action == Action.NEXT_SLIDE.value:
                         if state.currentSlide < state.totalSlides:
                             state.currentSlide += 1
-                            state.speakerNotes.currentSlideNotes = f"Nota de la diapositiva {state.currentSlide}"
                     elif msg.action == Action.PREV_SLIDE.value:
                         if state.currentSlide > 1:
                             state.currentSlide -= 1
-                            state.speakerNotes.currentSlideNotes = f"Nota de la diapositiva {state.currentSlide}"
                     elif msg.action == Action.FIRST_SLIDE.value:
                         state.currentSlide = 1
                     elif msg.action == Action.LAST_SLIDE.value:
@@ -378,8 +376,13 @@ def mock_slides(
                     elif msg.action == Action.TOGGLE_LASER.value:
                         state.isLaserActive = not state.isLaserActive
 
-                    # Enviar ACK y STATE_SYNC
-                    ack = Message.ack(msg.action, status="ok", extra={"requestId": req_id})
+                    # Las notas siguen a la diapositiva, la alcance como la alcance.
+                    state.speakerNotes.currentSlideNotes = f"Nota de la diapositiva {state.currentSlide}"
+
+                    # Enviar ACK y STATE_SYNC. Sin `source=EXTENSION` el daemon descarta
+                    # el ACK y el cliente espera hasta el límite (`dispatched_timeout_ack`).
+                    ack = Message.ack(msg.action, status="ok", source=Source.EXTENSION,
+                                      extra={"requestId": req_id})
                     await ws.send(ack.to_json())
                     await ws.send(Message.state_sync(state, source=Source.EXTENSION).to_json())
                     console.print(f"[bold green]Diapositiva actual -> {state.currentSlide}/{state.totalSlides}[/bold green]")
