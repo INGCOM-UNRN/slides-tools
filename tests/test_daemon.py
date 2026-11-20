@@ -169,3 +169,45 @@ async def test_daemon_pin_rate_limiting(daemon_fixture):
         blocked_resp = Message.from_json(await asyncio.wait_for(client.recv(), timeout=2.0))
         assert blocked_resp.type == MessageType.ERROR
         assert "Demasiados intentos" in blocked_resp.payload["reason"]
+        assert 0 < blocked_resp.payload["retryAfter"] <= 60
+
+
+@pytest.mark.asyncio
+async def test_token_vencido_no_bloquea_el_pin(daemon_fixture, caplog):
+    """Una app que reintenta con un token viejo (daemon reiniciado) no debe quedar
+    bloqueada: cuando el usuario teclea el PIN correcto, tiene que entrar."""
+    daemon, uri = daemon_fixture
+
+    with caplog.at_level("WARNING", logger="slide_tools.daemon"):
+        async with connect(uri, proxy=None) as client:
+            await client.recv()
+            for _ in range(daemon._intentos.maximo + 2):
+                await client.send(Message.command(Action.PAIR_REQUEST, {"token": "viejo"}).to_json())
+                resp = Message.from_json(await asyncio.wait_for(client.recv(), timeout=3.0))
+                assert resp.payload["code"] == ErrorCode.ERR_INVALID_PIN.value
+
+            await client.send(Message.command(Action.PAIR_REQUEST, {"pin": "4821"}).to_json())
+            ok = Message.from_json(await asyncio.wait_for(client.recv(), timeout=3.0))
+            assert ok.action == Action.PAIRING_SUCCESS.value
+
+    assert "token de reconexión vencido" in caplog.text
+    assert "rate limit" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_log_distingue_pin_equivocado_y_bloqueo(daemon_fixture, caplog):
+    """El log tiene que decir qué falló y cuánto dura el bloqueo, no sólo «bloqueado»."""
+    daemon, uri = daemon_fixture
+
+    with caplog.at_level("WARNING", logger="slide_tools.daemon"):
+        async with connect(uri, proxy=None) as client:
+            await client.recv()
+            for _ in range(daemon._intentos.maximo):
+                await client.send(Message.command(Action.PAIR_REQUEST, {"pin": "0000"}).to_json())
+                await asyncio.wait_for(client.recv(), timeout=3.0)
+            await client.send(Message.command(Action.PAIR_REQUEST, {"pin": "4821"}).to_json())
+            await asyncio.wait_for(client.recv(), timeout=3.0)
+
+    assert "PIN incorrecto (recibido 4 dígitos, intento 1/5)" in caplog.text
+    assert "intento 5/5" in caplog.text
+    assert "el PIN no se evalúa hasta dentro de" in caplog.text

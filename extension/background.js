@@ -11,6 +11,10 @@ let daemonPin = "";
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 let reconnectAttempts = 0;
+// Si el daemon rechazó el PIN, reintentar con el mismo PIN sólo suma fallos: tras 5 en un
+// minuto el daemon bloquea la IP y rechaza incluso el PIN correcto que se teclee después.
+// Se espera a que llegue una configuración nueva (CONFIG_UPDATED) antes de volver a conectar.
+let pinRechazado = false;
 
 function scheduleReconnect() {
   const base = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** reconnectAttempts);
@@ -91,8 +95,8 @@ function connectWebSocket() {
   ws.onclose = () => {
     isConnected = false;
     ws = null;
-    notifyTabsConnectionStatus(false);
-    if (daemonPin) {
+    notifyTabsConnectionStatus(false, pinRechazado, pinRechazado ? "ERR_INVALID_PIN" : "");
+    if (daemonPin && !pinRechazado) {
       scheduleReconnect();
     }
   };
@@ -133,7 +137,9 @@ function notifyTabsConnectionStatus(connected, requirePin = false, errorMsg = ""
 function handleDaemonMessage(msg) {
   if (msg.type === "error" && msg.payload?.code === "ERR_INVALID_PIN") {
     isConnected = false;
-    console.warn("[SlideBridge] Daemon rechazó el PIN:", msg.payload?.message);
+    pinRechazado = true;
+    console.warn("[SlideBridge] Daemon rechazó el PIN:", msg.payload?.reason,
+      "- no se reintenta hasta configurar el PIN de nuevo.");
     notifyTabsConnectionStatus(false, true, "ERR_INVALID_PIN");
     if (ws) ws.close();
     return;
@@ -238,6 +244,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     daemonPort = parseInt(message.port, 10) || daemonPort;
     daemonPin = message.pin !== undefined ? String(message.pin).trim() : daemonPin;
     currentSessionState.pin = daemonPin;
+    pinRechazado = false;
+    reconnectAttempts = 0;
     console.log("[SlideBridge] Nueva configuración recibida. Reconectando a", daemonHost, daemonPort);
     if (ws) {
       ws.close();

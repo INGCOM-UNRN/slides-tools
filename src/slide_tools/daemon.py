@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import random
 import time
 from typing import Any, Dict, Optional
@@ -42,6 +43,27 @@ __all__ = ["ClientSession", "SlideDaemon", "generar_pin"]
 
 
 logger = logging.getLogger("slide_tools.daemon")
+
+
+class _LimitadorConDiagnostico(LimitadorIntentos):
+    """`LimitadorIntentos` que además informa cuántos fallos lleva una IP y cuánto falta para liberarla.
+
+    Sin esto el log sólo decía «bloqueado», y no se podía saber desde cuándo ni hasta cuándo.
+    """
+
+    def fallos_recientes(self, ip: str) -> int:
+        ahora = self._reloj()
+        return sum(1 for t in self._fallos.get(ip, []) if ahora - t < self.ventana)
+
+    def segundos_restantes(self, ip: str) -> int:
+        """Segundos hasta que la IP vuelva a tener menos de `maximo` fallos en la ventana."""
+        ahora = self._reloj()
+        recientes = sorted(t for t in self._fallos.get(ip, []) if ahora - t < self.ventana)
+        if len(recientes) < self.maximo:
+            return 0
+        # Se libera cuando vence el fallo que la deja justo en el máximo.
+        vence = recientes[len(recientes) - self.maximo] + self.ventana
+        return max(1, math.ceil(vence - ahora))
 
 
 class ClientSession:
@@ -103,7 +125,7 @@ class SlideDaemon:
         self._clients: Dict[Any, ClientSession] = {}
         self._pending_commands: Dict[str, asyncio.Future] = {}
         self._cmd_counter: int = 0
-        self._intentos = LimitadorIntentos()
+        self._intentos = _LimitadorConDiagnostico()
         self._tokens = TokensEfimeros()
 
         # Estado canónico en memoria
@@ -242,15 +264,33 @@ class SlideDaemon:
         if msg.action == Action.PAIR_REQUEST.value:
             client_ip = session.remote_ip or "127.0.0.1"
 
-            if self._intentos.bloqueada(client_ip):
-                logger.warning(f"Intento de emparejamiento bloqueado por rate limit para {client_ip}")
-                err = Message.error("Demasiados intentos fallidos de PIN. Intente nuevamente más tarde.", ErrorCode.ERR_INVALID_PIN)
+            pin_recibido = msg.payload.get("pin")
+            token_recibido = msg.payload.get("token")
+            quien = f"{client_ip} [id={session.client_id}, {msg.payload.get('clientName', '?')}]"
+
+            # Una sesión ya emparejada (o un daemon sin PIN) no gasta intentos ni puede quedar bloqueada.
+            ya_autorizado = not self.require_pin or session.is_paired
+
+            if not ya_autorizado and self._intentos.bloqueada(client_ip):
+                restante = self._intentos.segundos_restantes(client_ip)
+                # Durante el bloqueo el PIN ni se mira, a propósito (si no, el límite no frena
+                # a quien prueba PIN al azar): por eso un PIN correcto también se rechaza.
+                logger.warning(
+                    "Emparejamiento bloqueado por rate limit para %s: %d PIN equivocados en %.0f s; "
+                    "el PIN no se evalúa hasta dentro de %d s",
+                    quien, self._intentos.fallos_recientes(client_ip), self._intentos.ventana, restante,
+                )
+                err = Message.error(
+                    f"Demasiados intentos fallidos de PIN. Intente nuevamente en {restante} s.",
+                    ErrorCode.ERR_INVALID_PIN,
+                )
+                err.payload["retryAfter"] = restante
                 await websocket.send(err.to_json())
                 return
 
-            credenciales_ok = (pin_correcto(msg.payload.get("pin"), self.pin)
-                               or self._tokens.validar(msg.payload.get("token")) is not None)
-            if not self.require_pin or session.is_paired or credenciales_ok:
+            pin_ok = pin_correcto(pin_recibido, self.pin)
+            token_ok = self._tokens.validar(token_recibido) is not None
+            if ya_autorizado or pin_ok or token_ok:
                 self._intentos.exito(client_ip)
                 session.is_paired = True
                 session.device_type = str(msg.payload.get("deviceType", "android"))
@@ -270,8 +310,18 @@ class SlideDaemon:
                 await websocket.send(ack.to_json())
                 await self._broadcast_state()
             else:
-                self._intentos.fallo(client_ip)
-                logger.warning("PIN incorrecto desde %s", client_ip)
+                if pin_recibido not in (None, ""):
+                    # Sólo cuenta como intento lo que puede adivinarse: el PIN. Un token de
+                    # 256 bits no se adivina, y uno vencido (daemon reiniciado, app que vuelve
+                    # al rato) no debe dejar a ese dispositivo bloqueado cuando teclee el PIN bien.
+                    self._intentos.fallo(client_ip)
+                    motivo = (f"PIN incorrecto (recibido {len(str(pin_recibido).strip())} dígitos, "
+                              f"intento {self._intentos.fallos_recientes(client_ip)}/{self._intentos.maximo})")
+                elif token_recibido:
+                    motivo = "token de reconexión vencido o desconocido, sin PIN (no cuenta como intento)"
+                else:
+                    motivo = "solicitud sin PIN ni token (no cuenta como intento)"
+                logger.warning("Emparejamiento rechazado desde %s: %s", quien, motivo)
                 await asyncio.sleep(1.0)
                 err = Message.error("PIN de emparejamiento incorrecto.", ErrorCode.ERR_INVALID_PIN)
                 await websocket.send(err.to_json())
